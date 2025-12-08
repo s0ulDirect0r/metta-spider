@@ -536,7 +536,7 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
             # Reset exploration state and go back to exploring
             state.exploration_complete = False
             state.phase = Phase.EXPLORE
-            logger.debug(f"  -> No extractor found for needed resources, resuming exploration")
+            logger.debug("  -> No extractor found for needed resources, resuming exploration")
             return self._do_explore(state)
 
         state.target_resource = resource
@@ -735,7 +735,7 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         if state.phase == Phase.EXPLORE:
             state.exploration_complete = True
             state.phase = Phase.GATHER
-            logger.debug(f"  -> Giving up exploration, switching to GATHER")
+            logger.debug("  -> Giving up exploration, switching to GATHER")
 
         # Clear stuck state and history
         state.stuck_detected = False
