@@ -51,9 +51,12 @@ from mettagrid.simulator import Action
 from mettagrid.simulator.interface import AgentObservation
 
 from metta_spider.types import (
+    AgentRole,
     CellType,
     ExtractorInfo,
     Phase,
+    ROLE_BY_AGENT_ID,
+    SharedTeamState,
     SpiderState,
     create_initial_state,
 )
@@ -83,12 +86,20 @@ ENERGY_HIGH = 80  # Exit RECHARGE when above this
 # Stuck detection
 POSITION_HISTORY_SIZE = 30
 
-# Resource to vibe mapping (for visual debugging in replays)
+# Resource to vibe mapping
+# resource_a = extract/withdraw, resource_b = deposit
 RESOURCE_TO_VIBE = {
     "carbon": "carbon_a",
     "oxygen": "oxygen_a",
     "germanium": "germanium_a",
     "silicon": "silicon_a",
+}
+
+RESOURCE_TO_DEPOSIT_VIBE = {
+    "carbon": "carbon_b",
+    "oxygen": "oxygen_b",
+    "germanium": "germanium_b",
+    "silicon": "silicon_b",
 }
 
 
@@ -105,15 +116,23 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
     - State updates
     - Phase transitions
     - Action selection
+
+    Each agent has a role that determines its behavior:
+    - CARBON/OXYGEN/GERMANIUM: Gather that resource and deposit to chest
+    - SILICON: Gather silicon, deposit, then withdraw all and assemble hearts
     """
 
     def __init__(
         self,
         policy_env_info: PolicyEnvInterface,
         agent_id: int,
+        team_state: SharedTeamState,
+        role: AgentRole,
     ):
         self._agent_id = agent_id
         self._policy_env_info = policy_env_info
+        self._team_state = team_state
+        self._role = role
 
         # Observation grid dimensions (typically 11x11, so half-radius is 5)
         self._obs_hr = policy_env_info.obs_height // 2
@@ -130,6 +149,8 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
 
         # Tag ID to name lookup (for parsing observations)
         self._tag_names = policy_env_info.tag_id_to_name
+
+        trace("role_assigned", agent_id, 0, role=role.value)
 
     # ========================================================================
     # State Initialization
@@ -408,18 +429,30 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
                 if state.assembler is None:
                     state.assembler = pos
                     trace("discovered", self._agent_id, state.step_count, type="assembler", pos=pos)
+                # Share with team
+                if self._team_state.assembler is None:
+                    self._team_state.assembler = pos
+                    trace("shared", self._agent_id, state.step_count, type="assembler", pos=pos)
 
             elif "chest" in obj_name:
                 state.occupancy[r][c] = CellType.OBSTACLE.value
                 if state.chest is None:
                     state.chest = pos
                     trace("discovered", self._agent_id, state.step_count, type="chest", pos=pos)
+                # Share with team
+                if self._team_state.chest is None:
+                    self._team_state.chest = pos
+                    trace("shared", self._agent_id, state.step_count, type="chest", pos=pos)
 
             elif "charger" in obj_name or "solar" in obj_name:
                 state.occupancy[r][c] = CellType.OBSTACLE.value
                 if state.charger is None:
                     state.charger = pos
                     trace("discovered", self._agent_id, state.step_count, type="charger", pos=pos)
+                # Share with team
+                if self._team_state.charger is None:
+                    self._team_state.charger = pos
+                    trace("shared", self._agent_id, state.step_count, type="charger", pos=pos)
 
     def _discover_extractor(
         self,
@@ -428,7 +461,7 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         resource_type: str,
         data: dict
     ) -> None:
-        """Add or update an extractor in state."""
+        """Add or update an extractor in state, and share with team."""
         if resource_type not in state.extractors:
             return
 
@@ -441,7 +474,7 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
                 ext.remaining_uses = data.get("remaining", 999)
                 return
 
-        # Add new extractor
+        # Add new extractor to local state
         state.extractors[resource_type].append(ExtractorInfo(
             position=pos,
             resource_type=resource_type,
@@ -451,12 +484,23 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         ))
         trace("discovered", self._agent_id, state.step_count, type=f"{resource_type}_extractor", pos=pos)
 
+        # Share with team (first extractor of this type wins)
+        if self._team_state.extractors[resource_type] is None:
+            self._team_state.extractors[resource_type] = pos
+            trace("shared", self._agent_id, state.step_count,
+                  type=f"{resource_type}_extractor", pos=pos)
+
     # ========================================================================
     # Phase Management
     # ========================================================================
 
     def _update_phase(self, state: SpiderState) -> None:
-        """Update phase based on current state."""
+        """Update phase based on current state and role.
+
+        Role-based behavior:
+        - Gatherers: EXPLORE → GATHER → DEPOSIT → GATHER (loop)
+        - Assembler: EXPLORE → WITHDRAW → ASSEMBLE → DELIVER → WITHDRAW (loop)
+        """
         # Priority 1: Recharge if energy low
         if state.energy < ENERGY_LOW:
             if state.phase != Phase.RECHARGE:
@@ -481,17 +525,84 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
                 state.cached_path = None
             return
 
-        # Priority 2: Deliver if we have hearts
+        # Priority 2: If exploring, check if complete
+        if state.phase == Phase.EXPLORE:
+            if is_exploration_complete(state):
+                ext_counts = {r: len(e) for r, e in state.extractors.items() if e}
+                # Track exploration completion for team coordination
+                self._team_state.exploration_done_count += 1
+                state.exploration_complete = True
+
+                # All roles go to GATHER after exploration
+                # SILICON role will later do WITHDRAW/ASSEMBLE via _update_phase_silicon_assembler
+                trace("phase", self._agent_id, state.step_count,
+                      old="explore", new="gather", reason="exploration_complete",
+                      role=self._role.value, extractors=ext_counts)
+                state.phase = Phase.GATHER
+                state.target = None
+                state.cached_path = None
+            return
+
+        # Role-specific phase transitions
+        # SILICON role also handles assembly (dual role: gatherer + assembler)
+        if self._role == AgentRole.SILICON:
+            self._update_phase_silicon_assembler(state)
+        else:
+            self._update_phase_gatherer(state)
+
+    def _update_phase_gatherer(self, state: SpiderState) -> None:
+        """Phase transitions for gatherer agents (CARBON, OXYGEN, GERMANIUM roles).
+
+        Loop: GATHER → DEPOSIT → GATHER
+        """
+        my_resource = self._role.value  # "carbon", "oxygen", or "germanium"
+
+        # If we have our resource, go deposit it
+        current_amount = getattr(state, my_resource, 0)
+        if current_amount > 0 and state.phase == Phase.GATHER:
+            trace("phase", self._agent_id, state.step_count,
+                  old="gather", new="deposit", reason="have_resource",
+                  resource=my_resource, amount=current_amount)
+            state.phase = Phase.DEPOSIT
+            state.target = None
+            state.cached_path = None
+            return
+
+        # If in DEPOSIT and we've deposited (no more resource), go back to GATHER
+        if state.phase == Phase.DEPOSIT and current_amount == 0:
+            trace("phase", self._agent_id, state.step_count,
+                  old="deposit", new="gather", reason="deposited")
+            state.phase = Phase.GATHER
+            state.target = None
+            state.cached_path = None
+            return
+
+        # Default: stay in current phase or go to GATHER
+        if state.phase not in (Phase.GATHER, Phase.DEPOSIT, Phase.EXPLORE, Phase.RECHARGE):
+            state.phase = Phase.GATHER
+            state.target = None
+            state.cached_path = None
+
+    def _update_phase_silicon_assembler(self, state: SpiderState) -> None:
+        """Phase transitions for SILICON agent (dual role: gatherer + assembler).
+
+        Loop: GATHER → DEPOSIT → WITHDRAW → ASSEMBLE → DELIVER → (repeat)
+
+        This agent gathers silicon like other gatherers, but also withdraws
+        the other resources and assembles hearts.
+        """
+        # If we have hearts, deliver them
         if state.hearts > 0:
             if state.phase != Phase.DELIVER:
                 trace("phase", self._agent_id, state.step_count,
-                      old=state.phase.value, new="deliver", reason="have_hearts", hearts=state.hearts)
+                      old=state.phase.value, new="deliver", reason="have_hearts",
+                      hearts=state.hearts)
                 state.phase = Phase.DELIVER
                 state.target = None
                 state.cached_path = None
             return
 
-        # Priority 3: Assemble if we have all resources
+        # If we can assemble, do it
         if self._can_assemble(state):
             if state.phase != Phase.ASSEMBLE:
                 trace("phase", self._agent_id, state.step_count,
@@ -501,22 +612,43 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
                 state.cached_path = None
             return
 
-        # Priority 4: If still exploring, continue
-        if state.phase == Phase.EXPLORE:
-            if is_exploration_complete(state):
-                ext_counts = {r: len(e) for r, e in state.extractors.items() if e}
-                trace("phase", self._agent_id, state.step_count,
-                      old="explore", new="gather", reason="exploration_complete",
-                      extractors=ext_counts, assembler=state.assembler,
-                      chest=state.chest, charger=state.charger)
-                state.exploration_complete = True
-                state.phase = Phase.GATHER
-                state.target = None
-                state.cached_path = None
+        # If we just delivered, go back to gathering silicon
+        if state.phase == Phase.DELIVER:
+            trace("phase", self._agent_id, state.step_count,
+                  old="deliver", new="gather", reason="delivered")
+            state.phase = Phase.GATHER
+            state.target = None
+            state.cached_path = None
             return
 
-        # Priority 5: Default to GATHER
-        if state.phase not in (Phase.GATHER, Phase.EXPLORE):
+        # If we have silicon, deposit it then go to withdraw
+        if state.silicon > 0 and state.phase == Phase.GATHER:
+            trace("phase", self._agent_id, state.step_count,
+                  old="gather", new="deposit", reason="have_silicon",
+                  silicon=state.silicon)
+            state.phase = Phase.DEPOSIT
+            state.target = None
+            state.cached_path = None
+            return
+
+        # If we just deposited, go to withdraw to get other resources
+        if state.phase == Phase.DEPOSIT and state.silicon == 0:
+            trace("phase", self._agent_id, state.step_count,
+                  old="deposit", new="withdraw", reason="deposited_silicon")
+            state.phase = Phase.WITHDRAW
+            state.target = None
+            state.cached_path = None
+            return
+
+        # If we're withdrawing but don't have enough resources, stay withdrawing
+        # Check if team has deposited enough for us to assemble
+        if state.phase == Phase.WITHDRAW:
+            # Stay in withdraw - the _do_withdraw will handle the logic
+            # But if we've been withdrawing too long without success, go gather more
+            return
+
+        # Default: go to GATHER (to get more silicon)
+        if state.phase not in (Phase.GATHER, Phase.DEPOSIT, Phase.WITHDRAW, Phase.ASSEMBLE, Phase.DELIVER, Phase.EXPLORE, Phase.RECHARGE):
             state.phase = Phase.GATHER
             state.target = None
             state.cached_path = None
@@ -534,13 +666,58 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         )
 
     def _get_desired_vibe(self, state: SpiderState) -> str:
-        """Get the vibe we should be in for current phase."""
+        """Get the vibe we should be in for current phase and role.
+
+        Vibe reference:
+        - resource_a: Extract from extractor (GATHER phase), also withdraw from chest
+        - resource_b: Deposit resource to chest (DEPOSIT phase)
+        - heart_a: Assemble hearts (ASSEMBLE phase)
+        - heart_b: Deposit hearts to chest (DELIVER phase)
+
+        For WITHDRAW, we need resource_a vibes to withdraw from chest.
+        """
         if state.phase == Phase.ASSEMBLE:
             return "heart_a"
         elif state.phase == Phase.DELIVER:
             return "heart_b"  # Deposit hearts to chest
-        elif state.phase == Phase.GATHER and state.target_resource:
-            return RESOURCE_TO_VIBE.get(state.target_resource, "default")
+        elif state.phase == Phase.DEPOSIT:
+            # All gatherers (including SILICON) deposit their resource
+            resource = self._role.value  # "carbon", "oxygen", "germanium", "silicon"
+            return f"{resource}_b"  # Deposit vibe
+        elif state.phase == Phase.WITHDRAW:
+            # SILICON agent withdraws resources - need the "extract" vibe for each resource
+            # We'll cycle through resources we need
+            return self._get_withdraw_vibe(state)
+        elif state.phase == Phase.GATHER:
+            # All gatherers gather their assigned resource
+            if self._role in (AgentRole.CARBON, AgentRole.OXYGEN, AgentRole.GERMANIUM, AgentRole.SILICON):
+                return f"{self._role.value}_a"  # Extract vibe
+            elif state.target_resource:
+                return RESOURCE_TO_VIBE.get(state.target_resource, "default")
+        return "default"
+
+    def _get_withdraw_vibe(self, state: SpiderState) -> str:
+        """Get the correct vibe for withdrawing resources from chest.
+
+        The assembler needs to withdraw each resource type, so we check
+        which resource we're missing most and set that vibe.
+        """
+        if state.heart_recipe is None:
+            return "carbon_a"  # Default
+
+        # Find which resource we need most
+        deficits = {
+            "carbon": max(0, state.heart_recipe.get("carbon", 0) - state.carbon),
+            "oxygen": max(0, state.heart_recipe.get("oxygen", 0) - state.oxygen),
+            "germanium": max(0, state.heart_recipe.get("germanium", 0) - state.germanium),
+            "silicon": max(0, state.heart_recipe.get("silicon", 0) - state.silicon),
+        }
+
+        # Get resource with highest deficit
+        max_resource = max(deficits.items(), key=lambda x: x[1])
+        if max_resource[1] > 0:
+            return f"{max_resource[0]}_a"  # Extract/withdraw vibe
+
         return "default"
 
     # ========================================================================
@@ -553,6 +730,10 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
             return self._do_explore(state)
         elif state.phase == Phase.GATHER:
             return self._do_gather(state)
+        elif state.phase == Phase.DEPOSIT:
+            return self._do_deposit(state)
+        elif state.phase == Phase.WITHDRAW:
+            return self._do_withdraw(state)
         elif state.phase == Phase.ASSEMBLE:
             return self._do_assemble(state)
         elif state.phase == Phase.DELIVER:
@@ -576,29 +757,38 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         return self._follow_path(state, path)
 
     def _do_gather(self, state: SpiderState) -> Action:
-        """Execute gathering phase."""
+        """Execute gathering phase.
+
+        Role-aware: gatherers only gather their assigned resource.
+        """
         # If we're already waiting at an extractor, handle that first
         # Don't recalculate target - finish what we started
         if state.waiting_at_extractor is not None:
             return self._handle_extractor_wait(state)
 
-        # Figure out what we need
-        deficits = self._calculate_deficits(state)
-
-        # Find an extractor for something we need
-        extractor, resource = self._find_needed_extractor(state, deficits)
+        # Role-aware: determine what resource to gather
+        if self._role in (AgentRole.CARBON, AgentRole.OXYGEN, AgentRole.GERMANIUM, AgentRole.SILICON):
+            # All gatherers (including SILICON) gather their assigned resource
+            my_resource = self._role.value
+            extractor = self._find_extractor_for_resource(state, my_resource)
+            resource = my_resource
+        else:
+            # Fallback: use deficit-based logic
+            deficits = self._calculate_deficits(state)
+            extractor, resource = self._find_needed_extractor(state, deficits)
 
         if extractor is None:
             # Don't know where to find what we need - explore more!
             # Reset exploration state and go back to exploring
             state.exploration_complete = False
             state.phase = Phase.EXPLORE
-            trace("gather_fail", self._agent_id, state.step_count, reason="no_extractor", deficits=deficits)
+            trace("gather_fail", self._agent_id, state.step_count,
+                  reason="no_extractor", resource=resource, role=self._role.value)
             return self._do_explore(state)
 
         state.target_resource = resource
         trace("gather_target", self._agent_id, state.step_count,
-              resource=resource, target=extractor.position)
+              resource=resource, target=extractor.position, role=self._role.value)
 
         # Navigate to extractor
         current = (state.row, state.col)
@@ -623,6 +813,29 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
             return self._follow_path(state, path)
 
         return self._noop()
+
+    def _find_extractor_for_resource(
+        self,
+        state: SpiderState,
+        resource: str
+    ) -> ExtractorInfo | None:
+        """Find an extractor for a specific resource type."""
+        extractors = state.extractors.get(resource, [])
+
+        # Filter to available extractors
+        available = [e for e in extractors if not e.clipped and e.remaining_uses > 0]
+
+        if available:
+            current = (state.row, state.col)
+            return min(available, key=lambda e: manhattan_distance(current, e.position))
+
+        # Check shared team state for fallback
+        shared_pos = self._team_state.extractors.get(resource)
+        if shared_pos:
+            # Create a temporary ExtractorInfo from shared position
+            return ExtractorInfo(position=shared_pos, resource_type=resource)
+
+        return None
 
     def _handle_extractor_wait(self, state: SpiderState) -> Action:
         """Handle waiting for resource from extractor."""
@@ -656,59 +869,150 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
 
         return self._noop()
 
-    def _do_assemble(self, state: SpiderState) -> Action:
-        """Execute assembly phase."""
-        if state.assembler is None:
+    def _do_deposit(self, state: SpiderState) -> Action:
+        """Execute deposit phase (gatherers depositing resources to chest).
+
+        Gatherers deposit their assigned resource to the shared chest,
+        making it available for the assembler to withdraw.
+        """
+        # Use local chest if known, otherwise try team's shared chest
+        chest = state.chest or self._team_state.chest
+        if chest is None:
+            trace("deposit_fail", self._agent_id, state.step_count, reason="no_chest")
             return self._noop()
 
+        # Update local state from team state if needed
+        if state.chest is None and self._team_state.chest is not None:
+            state.chest = self._team_state.chest
+
         current = (state.row, state.col)
+        my_resource = self._role.value  # "carbon", "oxygen", "germanium"
+        current_amount = getattr(state, my_resource, 0)
 
-        if is_adjacent(current, state.assembler):
-            # Use assembler
-            trace("assemble", self._agent_id, state.step_count, pos=state.assembler)
-            return self._use_object(state, state.assembler)
+        if is_adjacent(current, chest):
+            # We're at the chest - deposit!
+            trace("deposit", self._agent_id, state.step_count,
+                  pos=chest, resource=my_resource, amount=current_amount)
 
-        # Move toward assembler
-        path = find_path_to_target(state, state.assembler, reach_adjacent=True)
+            # Track what we're depositing for team coordination
+            self._team_state.deposited_resources[my_resource] += current_amount
+
+            return self._use_object(state, chest)
+
+        # Move toward chest
+        path = find_path_to_target(state, chest, reach_adjacent=True)
         if path:
             return self._follow_path(state, path)
 
+        trace("deposit_fail", self._agent_id, state.step_count, reason="no_path", chest=chest)
+        return self._noop()
+
+    def _do_withdraw(self, state: SpiderState) -> Action:
+        """Execute withdraw phase (assembler withdrawing resources from chest).
+
+        The assembler checks if the team has deposited enough resources,
+        then withdraws them from the chest.
+        """
+        # Use local chest if known, otherwise try team's shared chest
+        chest = state.chest or self._team_state.chest
+        if chest is None:
+            trace("withdraw_fail", self._agent_id, state.step_count, reason="no_chest")
+            return self._noop()
+
+        # Update local state from team state if needed
+        if state.chest is None and self._team_state.chest is not None:
+            state.chest = self._team_state.chest
+
+        current = (state.row, state.col)
+
+        if is_adjacent(current, chest):
+            # We're at the chest - withdraw!
+            # The vibe determines which resource we withdraw (set by _get_withdraw_vibe)
+            trace("withdraw", self._agent_id, state.step_count,
+                  pos=chest, deposited=self._team_state.deposited_resources)
+            return self._use_object(state, chest)
+
+        # Move toward chest
+        path = find_path_to_target(state, chest, reach_adjacent=True)
+        if path:
+            return self._follow_path(state, path)
+
+        trace("withdraw_fail", self._agent_id, state.step_count, reason="no_path", chest=chest)
+        return self._noop()
+
+    def _do_assemble(self, state: SpiderState) -> Action:
+        """Execute assembly phase."""
+        # Use local assembler if known, otherwise try team's shared assembler
+        assembler = state.assembler or self._team_state.assembler
+        if assembler is None:
+            trace("assemble_fail", self._agent_id, state.step_count, reason="no_assembler")
+            return self._noop()
+
+        # Update local state from team state if needed
+        if state.assembler is None and self._team_state.assembler is not None:
+            state.assembler = self._team_state.assembler
+
+        current = (state.row, state.col)
+
+        if is_adjacent(current, assembler):
+            # Use assembler
+            trace("assemble", self._agent_id, state.step_count, pos=assembler)
+            return self._use_object(state, assembler)
+
+        # Move toward assembler
+        path = find_path_to_target(state, assembler, reach_adjacent=True)
+        if path:
+            return self._follow_path(state, path)
+
+        trace("assemble_fail", self._agent_id, state.step_count, reason="no_path", assembler=assembler)
         return self._noop()
 
     def _do_deliver(self, state: SpiderState) -> Action:
-        """Execute delivery phase."""
-        if state.chest is None:
+        """Execute delivery phase (depositing hearts to chest)."""
+        # Use local chest if known, otherwise try team's shared chest
+        chest = state.chest or self._team_state.chest
+        if chest is None:
             trace("deliver_fail", self._agent_id, state.step_count, reason="no_chest")
             return self._noop()
 
+        # Update local state from team state if needed
+        if state.chest is None and self._team_state.chest is not None:
+            state.chest = self._team_state.chest
+
         current = (state.row, state.col)
 
-        if is_adjacent(current, state.chest):
+        if is_adjacent(current, chest):
             # Use chest
-            trace("deliver", self._agent_id, state.step_count, pos=state.chest, hearts=state.hearts)
-            return self._use_object(state, state.chest)
+            trace("deliver", self._agent_id, state.step_count, pos=chest, hearts=state.hearts)
+            return self._use_object(state, chest)
 
         # Move toward chest
-        path = find_path_to_target(state, state.chest, reach_adjacent=True)
+        path = find_path_to_target(state, chest, reach_adjacent=True)
         if path:
             return self._follow_path(state, path)
 
-        trace("deliver_fail", self._agent_id, state.step_count, reason="no_path", chest=state.chest)
+        trace("deliver_fail", self._agent_id, state.step_count, reason="no_path", chest=chest)
         return self._noop()
 
     def _do_recharge(self, state: SpiderState) -> Action:
         """Execute recharge phase."""
-        if state.charger is None:
+        # Use local charger if known, otherwise try team's shared charger
+        charger = state.charger or self._team_state.charger
+        if charger is None:
             return self._noop()
+
+        # Update local state from team state if needed
+        if state.charger is None and self._team_state.charger is not None:
+            state.charger = self._team_state.charger
 
         current = (state.row, state.col)
 
-        if is_adjacent(current, state.charger):
+        if is_adjacent(current, charger):
             # Use charger
-            return self._use_object(state, state.charger)
+            return self._use_object(state, charger)
 
         # Move toward charger
-        path = find_path_to_target(state, state.charger, reach_adjacent=True)
+        path = find_path_to_target(state, charger, reach_adjacent=True)
         if path:
             return self._follow_path(state, path)
 
@@ -792,20 +1096,10 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
     def _escape_stuck(self, state: SpiderState) -> Action | None:
         """Try to escape when stuck.
 
-        If stuck during EXPLORE, the frontier is probably unreachable.
-        Give up on exploration and move to GATHER phase.
+        Don't change phases - just do a random move to break out of the loop.
+        The frontier may still be reachable via a different route.
         """
         trace("escape_stuck", self._agent_id, state.step_count, phase=state.phase.value)
-
-        # If stuck during exploration, give up - frontiers are probably unreachable
-        if state.phase == Phase.EXPLORE:
-            ext_counts = {r: len(e) for r, e in state.extractors.items() if e}
-            trace("phase", self._agent_id, state.step_count,
-                  old="explore", new="gather", reason="stuck_escape",
-                  extractors=ext_counts, assembler=state.assembler,
-                  chest=state.chest, charger=state.charger)
-            state.exploration_complete = True
-            state.phase = Phase.GATHER
 
         # Clear stuck state and history
         state.stuck_detected = False
@@ -858,7 +1152,13 @@ class MettaSpiderPolicy(MultiAgentPolicy):
     Multi-agent policy wrapper for MettaSpider.
 
     This is the entry point that the game calls. It creates per-agent
-    policies that share no state (each agent explores independently).
+    policies that share a common team state for coordination.
+
+    Coordination Strategy:
+    - Agents 0-2 are gatherers (carbon, oxygen, germanium)
+    - Agent 3 is the assembler
+    - Gatherers deposit resources to chest
+    - Assembler withdraws from chest and makes hearts
     """
 
     short_names = ["metta_spider", "spider"]
@@ -867,9 +1167,20 @@ class MettaSpiderPolicy(MultiAgentPolicy):
         super().__init__(policy_env_info, **kwargs)
         self._agent_policies: dict[int, StatefulAgentPolicy[SpiderState]] = {}
 
+        # Shared state for team coordination
+        self._team_state = SharedTeamState()
+
     def agent_policy(self, agent_id: int) -> StatefulAgentPolicy[SpiderState]:
         if agent_id not in self._agent_policies:
-            impl = SpiderPolicyImpl(self._policy_env_info, agent_id)
+            # Get role for this agent (defaults to SILICON for unknown IDs - they assemble)
+            role = ROLE_BY_AGENT_ID.get(agent_id, AgentRole.SILICON)
+
+            impl = SpiderPolicyImpl(
+                self._policy_env_info,
+                agent_id,
+                team_state=self._team_state,
+                role=role,
+            )
             self._agent_policies[agent_id] = StatefulAgentPolicy(
                 impl,
                 self._policy_env_info,
