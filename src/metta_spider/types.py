@@ -263,6 +263,13 @@ class SpiderState:
     pending_deposit_resource: Optional[str] = None
     pending_deposit_amount: int = 0
 
+    # ========================================
+    # Withdraw Verification State
+    # ========================================
+    # Track inventory before withdraw to verify success
+    pending_withdraw: bool = False
+    inventory_before_withdraw: dict[str, int] = field(default_factory=dict)
+
 
 def create_initial_state(agent_id: int, map_size: int = 200) -> SpiderState:
     """

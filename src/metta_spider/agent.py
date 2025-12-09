@@ -530,16 +530,22 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         # Priority 2: If exploring, check if complete
         if state.phase == Phase.EXPLORE:
             if is_exploration_complete(state):
-                ext_counts = {r: len(e) for r, e in state.extractors.items() if e}
-                # Track exploration completion for team coordination
-                self._team_state.exploration_done_count += 1
-                state.exploration_complete = True
+                # Guard: only count exploration once per agent
+                if not state.exploration_complete:
+                    ext_counts = {r: len(e) for r, e in state.extractors.items() if e}
+                    # Track exploration completion for team coordination
+                    self._team_state.exploration_done_count += 1
+                    state.exploration_complete = True
+                    trace("phase", self._agent_id, state.step_count,
+                          old="explore", new="gather", reason="exploration_complete",
+                          role=self._role.value, extractors=ext_counts)
+                else:
+                    # Agent already explored, just transition without re-counting
+                    trace("phase", self._agent_id, state.step_count,
+                          old="explore", new="gather", reason="re_explored")
 
                 # All roles go to GATHER after exploration
                 # SILICON role will later do WITHDRAW/ASSEMBLE via _update_phase_silicon_assembler
-                trace("phase", self._agent_id, state.step_count,
-                      old="explore", new="gather", reason="exploration_complete",
-                      role=self._role.value, extractors=ext_counts)
                 state.phase = Phase.GATHER
                 state.target = None
                 state.cached_path = None
@@ -835,6 +841,10 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         shared_pos = self._team_state.extractors.get(resource)
         if shared_pos:
             # Create a temporary ExtractorInfo from shared position
+            # Note: Uses default values (cooldown=0, clipped=False) - agent will
+            # discover real state when adjacent. May waste steps if unusable.
+            trace("extractor_fallback", self._agent_id, state.step_count,
+                  resource=resource, pos=shared_pos, reason="using_team_shared")
             return ExtractorInfo(position=shared_pos, resource_type=resource)
 
         return None
@@ -944,12 +954,48 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         trace("deposit_fail", self._agent_id, state.step_count, reason="no_path", chest=chest)
         return self._noop()
 
+    def _handle_withdraw_verification(self, state: SpiderState) -> Action:
+        """Verify that a pending withdraw succeeded by checking inventory increased."""
+        if not state.pending_withdraw:
+            return self._noop()
+
+        # Check which resources increased
+        resources_gained: dict[str, int] = {}
+        for resource in ["carbon", "oxygen", "germanium", "silicon"]:
+            before = state.inventory_before_withdraw.get(resource, 0)
+            current = getattr(state, resource, 0)
+            if current > before:
+                resources_gained[resource] = current - before
+
+        if resources_gained:
+            trace("withdraw_verified", self._agent_id, state.step_count,
+                  gained=resources_gained)
+
+            # Reset deposited_resources for resources we successfully withdrew
+            for resource, amount in resources_gained.items():
+                # Decrease deposited count (don't go negative)
+                self._team_state.deposited_resources[resource] = max(
+                    0, self._team_state.deposited_resources[resource] - amount
+                )
+        else:
+            trace("withdraw_unverified", self._agent_id, state.step_count,
+                  inventory_before=state.inventory_before_withdraw)
+
+        # Clear pending state
+        state.pending_withdraw = False
+        state.inventory_before_withdraw = {}
+        return self._noop()
+
     def _do_withdraw(self, state: SpiderState) -> Action:
         """Execute withdraw phase (assembler withdrawing resources from chest).
 
         The assembler checks if the team has deposited enough resources,
         then withdraws them from the chest.
         """
+        # Check if we have a pending withdraw to verify
+        if state.pending_withdraw:
+            return self._handle_withdraw_verification(state)
+
         # Use local chest if known, otherwise try team's shared chest
         chest = state.chest or self._team_state.chest
         if chest is None:
@@ -963,8 +1009,15 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         current = (state.row, state.col)
 
         if is_adjacent(current, chest):
-            # We're at the chest - withdraw!
-            # The vibe determines which resource we withdraw (set by _get_withdraw_vibe)
+            # We're at the chest - initiate withdraw
+            # Store inventory before withdraw to verify success
+            state.pending_withdraw = True
+            state.inventory_before_withdraw = {
+                "carbon": state.carbon,
+                "oxygen": state.oxygen,
+                "germanium": state.germanium,
+                "silicon": state.silicon,
+            }
             trace("withdraw", self._agent_id, state.step_count,
                   pos=chest, deposited=self._team_state.deposited_resources)
             return self._use_object(state, chest)
