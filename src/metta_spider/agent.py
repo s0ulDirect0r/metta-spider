@@ -15,6 +15,7 @@ Phases:
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import random
@@ -34,6 +35,7 @@ logger.addHandler(_fh)
 
 # Structured trace file (JSON lines)
 _trace_file = open(TRACE_FILE, 'w')
+atexit.register(_trace_file.close)
 
 def trace(event: str, agent_id: int, step: int, **data: Any) -> None:
     """Write a structured trace event as JSON line."""
@@ -869,12 +871,46 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
 
         return self._noop()
 
+    def _handle_deposit_verification(self, state: SpiderState) -> Action:
+        """Verify that a pending deposit succeeded by checking inventory decreased."""
+        resource = state.pending_deposit_resource
+        if resource is None:
+            return self._noop()
+
+        current_amount = getattr(state, resource, 0)
+
+        # Deposit succeeded if we now have less of the resource
+        if current_amount < state.pending_deposit_amount:
+            deposited = state.pending_deposit_amount - current_amount
+            trace("deposit_verified", self._agent_id, state.step_count,
+                  resource=resource, deposited=deposited)
+
+            # NOW update team's deposited_resources (verified)
+            self._team_state.deposited_resources[resource] += deposited
+
+            # Clear pending state
+            state.pending_deposit_resource = None
+            state.pending_deposit_amount = 0
+        else:
+            # Deposit may have failed or is still processing - clear and retry
+            trace("deposit_unverified", self._agent_id, state.step_count,
+                  resource=resource, expected_decrease=state.pending_deposit_amount,
+                  current=current_amount)
+            state.pending_deposit_resource = None
+            state.pending_deposit_amount = 0
+
+        return self._noop()
+
     def _do_deposit(self, state: SpiderState) -> Action:
         """Execute deposit phase (gatherers depositing resources to chest).
 
         Gatherers deposit their assigned resource to the shared chest,
         making it available for the assembler to withdraw.
         """
+        # Check if we have a pending deposit to verify
+        if state.pending_deposit_resource is not None:
+            return self._handle_deposit_verification(state)
+
         # Use local chest if known, otherwise try team's shared chest
         chest = state.chest or self._team_state.chest
         if chest is None:
@@ -886,16 +922,17 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
             state.chest = self._team_state.chest
 
         current = (state.row, state.col)
-        my_resource = self._role.value  # "carbon", "oxygen", "germanium"
+        my_resource = self._role.value  # "carbon", "oxygen", "germanium", "silicon"
         current_amount = getattr(state, my_resource, 0)
 
         if is_adjacent(current, chest):
-            # We're at the chest - deposit!
+            # We're at the chest - initiate deposit
             trace("deposit", self._agent_id, state.step_count,
                   pos=chest, resource=my_resource, amount=current_amount)
 
-            # Track what we're depositing for team coordination
-            self._team_state.deposited_resources[my_resource] += current_amount
+            # Store pending deposit - will verify on next step
+            state.pending_deposit_resource = my_resource
+            state.pending_deposit_amount = current_amount
 
             return self._use_object(state, chest)
 

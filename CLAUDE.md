@@ -39,7 +39,7 @@ cat /tmp/metta_spider.log
 
 ## Architecture
 
-```
+```text
 src/metta_spider/
 ├── __init__.py      # Exports MettaSpiderPolicy
 ├── agent.py         # Main policy logic (SpiderPolicyImpl)
@@ -69,7 +69,7 @@ src/metta_spider/
 
 ### Phase State Machine
 
-```
+```text
 EXPLORE ─────────────────────────────────────────────────┐
     │ (map complete)                                     │
     ▼                                                    │

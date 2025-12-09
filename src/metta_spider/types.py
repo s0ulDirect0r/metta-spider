@@ -54,8 +54,7 @@ class AgentRole(Enum):
 
     Each agent specializes in one resource:
     - All agents gather their assigned resource and deposit to chest
-    - All agents can assemble hearts when they have all resources
-    - The "assembler" role handles silicon + coordination
+    - Only the SILICON role withdraws resources and assembles hearts
     """
     CARBON = "carbon"        # Agent 0: gathers carbon
     OXYGEN = "oxygen"        # Agent 1: gathers oxygen
@@ -257,6 +256,12 @@ class SpiderState:
     wait_steps: int = 0
     pending_resource: Optional[str] = None
     pending_amount: int = 0
+
+    # ========================================
+    # Deposit Verification State
+    # ========================================
+    pending_deposit_resource: Optional[str] = None
+    pending_deposit_amount: int = 0
 
 
 def create_initial_state(agent_id: int, map_size: int = 200) -> SpiderState:

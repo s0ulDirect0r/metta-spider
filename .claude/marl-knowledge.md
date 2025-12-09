@@ -87,7 +87,7 @@ Load this when working on: policy architecture, training pipelines, reward shapi
 
 ## Training Pipeline
 
-```
+```text
 Phase 1: Scripted baseline ← WE ARE HERE
     └─ Understand environment, collect traces
 
