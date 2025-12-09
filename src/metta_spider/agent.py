@@ -456,27 +456,34 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         if resource_type not in state.extractors:
             return
 
+        # If team already knows this extractor is depleted, mark it immediately
+        team_knows_depleted = pos in self._team_state.depleted_extractors
+
         # Check if we already know about this extractor
         for ext in state.extractors[resource_type]:
             if ext.position == pos:
-                # Update existing - but preserve our depleted marking
+                # Update existing - but preserve depleted marking
                 ext.cooldown_remaining = data.get("cooldown", 0)
                 ext.clipped = data.get("clipped", 0) > 0
-                # Don't overwrite if we've marked it depleted (remaining_uses=0)
-                # Game might not report depletion correctly
-                if ext.remaining_uses != 0:
+                # Sync with team's depleted knowledge
+                if team_knows_depleted:
+                    ext.remaining_uses = 0
+                elif ext.remaining_uses != 0:
                     ext.remaining_uses = data.get("remaining", 999)
                 return
 
         # Add new extractor to local state
+        # If team knows it's depleted, mark it as such from the start
+        remaining = 0 if team_knows_depleted else data.get("remaining", 999)
         state.extractors[resource_type].append(ExtractorInfo(
             position=pos,
             resource_type=resource_type,
             cooldown_remaining=data.get("cooldown", 0),
             clipped=data.get("clipped", 0) > 0,
-            remaining_uses=data.get("remaining", 999),
+            remaining_uses=remaining,
         ))
-        trace("discovered", self._agent_id, state.step_count, type=f"{resource_type}_extractor", pos=pos)
+        trace("discovered", self._agent_id, state.step_count,
+              type=f"{resource_type}_extractor", pos=pos, team_depleted=team_knows_depleted)
 
         # Share with team (first extractor of this type wins)
         if self._team_state.extractors[resource_type] is None:
@@ -675,8 +682,11 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
                       resource=resource, pos=extractor.position,
                       remaining=extractor.remaining_uses, clipped=extractor.clipped,
                       cooldown=extractor.cooldown_remaining)
-                # Mark it so we don't keep coming back
+                # Mark it locally AND share with team so others avoid it
                 extractor.remaining_uses = 0
+                self._team_state.depleted_extractors.add(extractor.position)
+                trace("shared_depleted", self._agent_id, state.step_count,
+                      pos=extractor.position, resource=resource)
                 # Clear target and let next iteration find a different extractor
                 state.target_resource = None
                 return self._noop()
@@ -798,11 +808,15 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         resource: str,
         pos: tuple[int, int]
     ) -> None:
-        """Mark an extractor as depleted so we don't keep trying it."""
+        """Mark an extractor as depleted locally AND share with team."""
         extractors = state.extractors.get(resource, [])
         for ext in extractors:
             if ext.position == pos:
                 ext.remaining_uses = 0
+                # Share with team so all agents avoid this extractor
+                self._team_state.depleted_extractors.add(pos)
+                trace("shared_depleted", self._agent_id, state.step_count,
+                      pos=pos, resource=resource)
                 return
 
     def _do_assemble(self, state: SpiderState) -> Action:
@@ -905,7 +919,16 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         state: SpiderState,
         deficits: dict[str, int]
     ) -> tuple[ExtractorInfo | None, str]:
-        """Find nearest extractor for a resource we need."""
+        """Find extractor using agent_id to distribute across team.
+
+        Instead of all agents picking the same "nearest" extractor, we:
+        1. Filter out team-known depleted extractors
+        2. Find candidates within tolerance distance of nearest
+        3. Use agent_id to pick deterministically from candidates
+        4. Fall back to team-shared positions if local list is empty
+
+        This distributes agents across available extractors.
+        """
         current = (state.row, state.col)
 
         # Sort by deficit (highest first)
@@ -917,18 +940,50 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
 
             extractors = state.extractors.get(resource, [])
 
-            # Filter to available extractors
-            available = [e for e in extractors if not e.clipped and e.remaining_uses > 0]
+            # Filter: available AND not team-depleted
+            available = [
+                e for e in extractors
+                if not e.clipped
+                and e.remaining_uses > 0
+                and e.position not in self._team_state.depleted_extractors
+            ]
 
-            if available:
-                # Return nearest
-                nearest = min(available, key=lambda e: manhattan_distance(current, e.position))
-                return nearest, resource
+            # If no local extractors, check team-shared position
+            if not available:
+                shared_pos = self._team_state.extractors.get(resource)
+                if shared_pos and shared_pos not in self._team_state.depleted_extractors:
+                    trace("extractor_fallback", self._agent_id, state.step_count,
+                          resource=resource, pos=shared_pos, reason="using_team_shared")
+                    return ExtractorInfo(position=shared_pos, resource_type=resource), resource
+                continue
+
+            if len(available) == 1:
+                return available[0], resource
+
+            # Distribute agents across near-equal options
+            sorted_by_dist = sorted(
+                available, key=lambda e: manhattan_distance(current, e.position)
+            )
+            nearest_dist = manhattan_distance(current, sorted_by_dist[0].position)
+            tolerance = 5  # Extractors within 5 steps considered equally close
+            candidates = [
+                e for e in sorted_by_dist
+                if manhattan_distance(current, e.position) <= nearest_dist + tolerance
+            ]
+
+            # Use agent_id to pick deterministically
+            idx = state.agent_id % len(candidates)
+            return candidates[idx], resource
 
         return None, ""
 
     def _follow_path(self, state: SpiderState, path: list[tuple[int, int]]) -> Action:
-        """Take the next step along a path."""
+        """Take the next step along a path, with smart collision handling.
+
+        Instead of immediately falling back to random moves when blocked,
+        we wait briefly (2 steps) to let the other agent move, then try
+        to find an alternate path around them.
+        """
         if not path:
             return self._noop()
 
@@ -937,8 +992,37 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
 
         # Check for agent collision
         if next_pos in state.agent_positions:
-            # Someone's in the way - try random direction
+            state.collision_wait_steps += 1
+
+            # Wait briefly to let other agent move
+            if state.collision_wait_steps < 3:
+                return self._noop()
+
+            # Waited too long - try to find alternate path
+            state.collision_wait_steps = 0
+
+            if len(path) > 1:
+                dest = path[-1]
+                blocked_r, blocked_c = next_pos
+                # Temporarily mark blocked cell as obstacle
+                old_value = state.occupancy[blocked_r][blocked_c]
+                state.occupancy[blocked_r][blocked_c] = CellType.OBSTACLE.value
+                alt_path = find_path_to_target(state, dest, reach_adjacent=True)
+                state.occupancy[blocked_r][blocked_c] = old_value
+
+                if alt_path:
+                    # Found alternate route - follow it (but don't recurse forever)
+                    alt_next = alt_path[0]
+                    if alt_next not in state.agent_positions:
+                        direction = direction_to_target(current, alt_next)
+                        if direction:
+                            return self._actions.move.Move(direction)
+
+            # No alternate path found - fall back to random
             return self._random_move(state)
+
+        # Clear wait counter when path is clear
+        state.collision_wait_steps = 0
 
         direction = direction_to_target(current, next_pos)
         if direction:
