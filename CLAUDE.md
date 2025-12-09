@@ -85,17 +85,39 @@ cat /tmp/metta_spider.jsonl | jq -c 'select(.event == "gather_target")' | tail -
 
 ---
 
+## Reading Eval Output
+
+The goal is to maximize hearts. Key metric: `chest.heart.amount` in "Average Game Stats".
+
+- `chest.heart.amount` = actual hearts deposited (the goal)
+- `Per-Agent Reward` = composite score (resources, movement, etc.) - useful but not the goal
+
+Current performance on `training_facility` (max 2 hearts possible):
+- Baseline 1 agent: **1.0 hearts** (consistent)
+- Spider 1 agent: **0.2 hearts** (inconsistent - sometimes 2, usually 0)
+
+The spider can hit 2 hearts (optimal) but has poor consistency.
+
+---
+
 ## Quick Reference
 
 ```bash
-# Run policy (MUST use full class path)
+# List available policies (shows shortnames)
+cogames policies
+
+# Run spider policy
 cogames play -m training_facility -p class=metta_spider.agent.MettaSpiderPolicy --render unicode --steps 100
 
-# Evaluate
-cogames eval -set integrated_evals -p class=metta_spider.agent.MettaSpiderPolicy
+# Run baseline for comparison (use shortname)
+cogames play -m training_facility -p class=scripted_baseline --render text --steps 100
 
-# Baseline comparison
-cogames play -m training_facility -p class=baseline --render text --steps 100
+# Evaluate on specific mission with N agents
+cogames eval -m training_facility -c 1 -p class=metta_spider.agent.MettaSpiderPolicy -e 10 --steps 1000
+cogames eval -m training_facility -c 4 -p class=metta_spider.agent.MettaSpiderPolicy -e 10 --steps 1000
+
+# List available missions
+cogames missions
 
 # View traces (structured JSON)
 cat /tmp/metta_spider.jsonl | jq .
@@ -179,11 +201,21 @@ RECHARGE interrupts any phase when energy < 30
 
 ---
 
-## Reference Code
+## Deep Reference Documentation
 
-Baseline scripted agent: `../cogames/src/cogames/policy/scripted_agent/`
-- `baseline_agent.py` - full pathfinding implementation
-- Study how it handles edge cases we're missing
+For detailed API/engine reference, load these files as needed:
+
+| File | When to Load |
+|------|--------------|
+| `.claude/spider-context.md` | Spider-specific design, failure modes, debugging |
+| `.claude/mettagrid-reference.md` | Observation parsing, actions, game mechanics |
+| `.claude/cogames-reference.md` | CLI usage, evaluation, game loop |
+| `.claude/policy-api-reference.md` | Building/modifying policy classes |
+| `.claude/marl-knowledge.md` | MARL architecture (future ML phase) |
+
+**Baseline agent source** (reference implementation):
+- `scripted_baseline` = `cogames.policy.scripted_agent.baseline_agent.BaselinePolicy`
+- Located at: `../metta/packages/cogames/src/cogames/policy/scripted_agent/`
 
 ---
 
