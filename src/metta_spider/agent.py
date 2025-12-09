@@ -15,12 +15,15 @@ Phases:
 
 from __future__ import annotations
 
+import json
 import logging
 import random
-from typing import Optional
+from typing import Any, Optional
 
 # Set up file-only logging - don't propagate to root logger (which prints to terminal)
 LOG_FILE = "/tmp/metta_spider.log"
+TRACE_FILE = "/tmp/metta_spider.jsonl"
+
 logger = logging.getLogger("metta_spider")
 logger.setLevel(logging.DEBUG)
 logger.propagate = False  # Don't send to root logger / terminal
@@ -28,6 +31,18 @@ logger.handlers = []
 _fh = logging.FileHandler(LOG_FILE, mode='w')
 _fh.setFormatter(logging.Formatter('%(message)s'))
 logger.addHandler(_fh)
+
+# Structured trace file (JSON lines)
+_trace_file = open(TRACE_FILE, 'w')
+
+def trace(event: str, agent_id: int, step: int, **data: Any) -> None:
+    """Write a structured trace event as JSON line."""
+    record = {"event": event, "agent": agent_id, "step": step, **data}
+    _trace_file.write(json.dumps(record) + "\n")
+    _trace_file.flush()
+    # Also write human-readable version to text log
+    detail = ", ".join(f"{k}={v}" for k, v in data.items()) if data else ""
+    logger.debug(f"[{event}] agent={agent_id} step={step} {detail}")
 
 from mettagrid.config.vibes import VIBE_BY_NAME
 from mettagrid.policy.policy import MultiAgentPolicy, StatefulAgentPolicy, StatefulPolicyImpl
@@ -131,6 +146,8 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
                 state.heart_recipe.pop("energy", None)  # Don't track energy as gatherable
                 break
 
+        trace("init", self._agent_id, 0, recipe=state.heart_recipe)
+
         return state
 
     # ========================================================================
@@ -192,13 +209,6 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         action = self._execute_phase(state)
         state.last_action = action
 
-        # Log state
-        logger.debug(
-            f"Step {state.step_count}: phase={state.phase.value}, vibe={state.current_vibe}, "
-            f"pos=({state.row},{state.col}), action={action.name}, "
-            f"inv=[C:{state.carbon} O:{state.oxygen} G:{state.germanium} S:{state.silicon} H:{state.hearts}], "
-            f"energy={state.energy}, waiting={state.waiting_at_extractor}"
-        )
 
         return action, state
 
@@ -307,7 +317,7 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         # If we've only visited 4 or fewer unique positions in 12 steps, we're stuck
         if unique_count <= 4:
             state.stuck_detected = True
-            logger.debug(f"  -> STUCK detected: {unique_count} unique positions in last 12 moves")
+            trace("stuck", self._agent_id, state.step_count, unique_positions=unique_count)
 
     def _update_map_from_observation(
         self,
@@ -397,17 +407,19 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
                 state.occupancy[r][c] = CellType.OBSTACLE.value
                 if state.assembler is None:
                     state.assembler = pos
+                    trace("discovered", self._agent_id, state.step_count, type="assembler", pos=pos)
 
             elif "chest" in obj_name:
                 state.occupancy[r][c] = CellType.OBSTACLE.value
                 if state.chest is None:
                     state.chest = pos
-                    logger.debug(f"  -> DISCOVERED chest at {pos}")
+                    trace("discovered", self._agent_id, state.step_count, type="chest", pos=pos)
 
             elif "charger" in obj_name or "solar" in obj_name:
                 state.occupancy[r][c] = CellType.OBSTACLE.value
                 if state.charger is None:
                     state.charger = pos
+                    trace("discovered", self._agent_id, state.step_count, type="charger", pos=pos)
 
     def _discover_extractor(
         self,
@@ -437,6 +449,7 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
             clipped=data.get("clipped", 0) > 0,
             remaining_uses=data.get("remaining", 999),
         ))
+        trace("discovered", self._agent_id, state.step_count, type=f"{resource_type}_extractor", pos=pos)
 
     # ========================================================================
     # Phase Management
@@ -447,6 +460,8 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         # Priority 1: Recharge if energy low
         if state.energy < ENERGY_LOW:
             if state.phase != Phase.RECHARGE:
+                trace("phase", self._agent_id, state.step_count,
+                      old=state.phase.value, new="recharge", reason="low_energy", energy=state.energy)
                 state.phase_before_recharge = state.phase
                 state.phase = Phase.RECHARGE
                 state.target = None
@@ -457,7 +472,10 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         if state.phase == Phase.RECHARGE:
             if state.energy >= ENERGY_HIGH:
                 # Restore previous phase
-                state.phase = state.phase_before_recharge or Phase.EXPLORE
+                prev = state.phase_before_recharge or Phase.EXPLORE
+                trace("phase", self._agent_id, state.step_count,
+                      old="recharge", new=prev.value, reason="recharged", energy=state.energy)
+                state.phase = prev
                 state.phase_before_recharge = None
                 state.target = None
                 state.cached_path = None
@@ -466,6 +484,8 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         # Priority 2: Deliver if we have hearts
         if state.hearts > 0:
             if state.phase != Phase.DELIVER:
+                trace("phase", self._agent_id, state.step_count,
+                      old=state.phase.value, new="deliver", reason="have_hearts", hearts=state.hearts)
                 state.phase = Phase.DELIVER
                 state.target = None
                 state.cached_path = None
@@ -474,6 +494,8 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         # Priority 3: Assemble if we have all resources
         if self._can_assemble(state):
             if state.phase != Phase.ASSEMBLE:
+                trace("phase", self._agent_id, state.step_count,
+                      old=state.phase.value, new="assemble", reason="have_resources")
                 state.phase = Phase.ASSEMBLE
                 state.target = None
                 state.cached_path = None
@@ -482,6 +504,11 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         # Priority 4: If still exploring, continue
         if state.phase == Phase.EXPLORE:
             if is_exploration_complete(state):
+                ext_counts = {r: len(e) for r, e in state.extractors.items() if e}
+                trace("phase", self._agent_id, state.step_count,
+                      old="explore", new="gather", reason="exploration_complete",
+                      extractors=ext_counts, assembler=state.assembler,
+                      chest=state.chest, charger=state.charger)
                 state.exploration_complete = True
                 state.phase = Phase.GATHER
                 state.target = None
@@ -566,10 +593,12 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
             # Reset exploration state and go back to exploring
             state.exploration_complete = False
             state.phase = Phase.EXPLORE
-            logger.debug("  -> No extractor found for needed resources, resuming exploration")
+            trace("gather_fail", self._agent_id, state.step_count, reason="no_extractor", deficits=deficits)
             return self._do_explore(state)
 
         state.target_resource = resource
+        trace("gather_target", self._agent_id, state.step_count,
+              resource=resource, target=extractor.position)
 
         # Navigate to extractor
         current = (state.row, state.col)
@@ -607,6 +636,9 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         current_amount = getattr(state, resource, 0)
         if current_amount > state.pending_amount:
             # Success! Clear waiting state
+            gained = current_amount - state.pending_amount
+            trace("gathered", self._agent_id, state.step_count,
+                  resource=resource, gained=gained, total=current_amount)
             state.waiting_at_extractor = None
             state.pending_resource = None
             state.pending_amount = 0
@@ -633,6 +665,7 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
 
         if is_adjacent(current, state.assembler):
             # Use assembler
+            trace("assemble", self._agent_id, state.step_count, pos=state.assembler)
             return self._use_object(state, state.assembler)
 
         # Move toward assembler
@@ -645,23 +678,22 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
     def _do_deliver(self, state: SpiderState) -> Action:
         """Execute delivery phase."""
         if state.chest is None:
-            logger.debug("  -> DELIVER: No chest known!")
+            trace("deliver_fail", self._agent_id, state.step_count, reason="no_chest")
             return self._noop()
 
         current = (state.row, state.col)
 
         if is_adjacent(current, state.chest):
             # Use chest
-            logger.debug(f"  -> DELIVER: Adjacent to chest at {state.chest}, using it")
+            trace("deliver", self._agent_id, state.step_count, pos=state.chest, hearts=state.hearts)
             return self._use_object(state, state.chest)
 
         # Move toward chest
         path = find_path_to_target(state, state.chest, reach_adjacent=True)
         if path:
-            logger.debug(f"  -> DELIVER: current={current}, chest={state.chest}, path[0]={path[0]}, path_len={len(path)}")
             return self._follow_path(state, path)
 
-        logger.debug(f"  -> DELIVER: No path to chest at {state.chest} from {current}")
+        trace("deliver_fail", self._agent_id, state.step_count, reason="no_path", chest=state.chest)
         return self._noop()
 
     def _do_recharge(self, state: SpiderState) -> Action:
@@ -763,13 +795,17 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         If stuck during EXPLORE, the frontier is probably unreachable.
         Give up on exploration and move to GATHER phase.
         """
-        logger.debug(f"  -> Escaping stuck state (phase={state.phase.value})")
+        trace("escape_stuck", self._agent_id, state.step_count, phase=state.phase.value)
 
         # If stuck during exploration, give up - frontiers are probably unreachable
         if state.phase == Phase.EXPLORE:
+            ext_counts = {r: len(e) for r, e in state.extractors.items() if e}
+            trace("phase", self._agent_id, state.step_count,
+                  old="explore", new="gather", reason="stuck_escape",
+                  extractors=ext_counts, assembler=state.assembler,
+                  chest=state.chest, charger=state.charger)
             state.exploration_complete = True
             state.phase = Phase.GATHER
-            logger.debug("  -> Giving up exploration, switching to GATHER")
 
         # Clear stuck state and history
         state.stuck_detected = False
