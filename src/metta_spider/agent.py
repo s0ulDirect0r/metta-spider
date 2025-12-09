@@ -1007,7 +1007,9 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
                 # Temporarily mark blocked cell as obstacle
                 old_value = state.occupancy[blocked_r][blocked_c]
                 state.occupancy[blocked_r][blocked_c] = CellType.OBSTACLE.value
-                alt_path = find_path_to_target(state, dest, reach_adjacent=True)
+                # Use reach_adjacent=False since dest is already the cell we want
+                # (original path already computed adjacency if needed)
+                alt_path = find_path_to_target(state, dest, reach_adjacent=False)
                 state.occupancy[blocked_r][blocked_c] = old_value
 
                 if alt_path:
