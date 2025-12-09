@@ -156,8 +156,10 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         # ========================================
         # OBSERVE: Parse observation
         # ========================================
+        # Save energy BEFORE reading new inventory (for move success detection)
+        prev_energy = state.energy
         self._read_inventory(state, obs)
-        self._update_position(state)
+        self._update_position(state, prev_energy)
         self._update_map_from_observation(state, obs)
 
         # ========================================
@@ -192,7 +194,7 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
 
         # Log state
         logger.debug(
-            f"Step {state.step_count}: phase={state.phase.value}, "
+            f"Step {state.step_count}: phase={state.phase.value}, vibe={state.current_vibe}, "
             f"pos=({state.row},{state.col}), action={action.name}, "
             f"inv=[C:{state.carbon} O:{state.oxygen} G:{state.germanium} S:{state.silicon} H:{state.hearts}], "
             f"energy={state.energy}, waiting={state.waiting_at_extractor}"
@@ -205,39 +207,46 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
     # ========================================================================
 
     def _read_inventory(self, state: SpiderState, obs: AgentObservation) -> None:
-        """Read inventory from observation tokens at center cell."""
+        """Read inventory from observation tokens at center cell.
+
+        Important: Tokens with value 0 are not sent, so we collect into a dict
+        and use .get(key, 0) to default missing values to 0.
+        """
         center = (self._obs_hr, self._obs_wr)
 
+        # Collect inventory tokens into dict
+        inv = {}
         for tok in obs.tokens:
             if tok.location != center:
                 continue
-
             name = tok.feature.name
             if name.startswith("inv:"):
                 resource = name[4:]  # Remove "inv:" prefix
-                if resource == "carbon":
-                    state.carbon = tok.value
-                elif resource == "oxygen":
-                    state.oxygen = tok.value
-                elif resource == "germanium":
-                    state.germanium = tok.value
-                elif resource == "silicon":
-                    state.silicon = tok.value
-                elif resource == "heart":
-                    state.hearts = tok.value
-                elif resource == "energy":
-                    state.energy = tok.value
-                elif resource == "decoder":
-                    state.decoder = tok.value
-                elif resource == "modulator":
-                    state.modulator = tok.value
-                elif resource == "resonator":
-                    state.resonator = tok.value
-                elif resource == "scrambler":
-                    state.scrambler = tok.value
+                inv[resource] = tok.value
 
-    def _update_position(self, state: SpiderState) -> None:
-        """Update position based on last action."""
+        # Update state with defaults for missing tokens
+        state.carbon = inv.get("carbon", 0)
+        state.oxygen = inv.get("oxygen", 0)
+        state.germanium = inv.get("germanium", 0)
+        state.silicon = inv.get("silicon", 0)
+        state.hearts = inv.get("heart", 0)
+        state.energy = inv.get("energy", 0)
+        state.decoder = inv.get("decoder", 0)
+        state.modulator = inv.get("modulator", 0)
+        state.resonator = inv.get("resonator", 0)
+        state.scrambler = inv.get("scrambler", 0)
+
+    def _update_position(self, state: SpiderState, prev_energy: int) -> None:
+        """Update position based on last action and energy change.
+
+        We detect move success/failure by checking energy change:
+        - Successful move: -2 energy cost, +1 regen = net -1
+        - Failed move: no cost, +1 regen = net +1
+
+        Edge cases:
+        - At energy cap (255): no regen, so success=-2, fail=0
+        - First step: no prev_energy, assume success
+        """
         # Only update if we moved (not if we used an object)
         if state.last_action and not state.using_object_this_step:
             action_name = state.last_action.name
@@ -245,8 +254,28 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
                 direction = action_name[5:]  # Remove "move_" prefix
                 if direction in self._move_deltas:
                     dr, dc = self._move_deltas[direction]
-                    state.row += dr
-                    state.col += dc
+
+                    # Detect if move succeeded via energy change
+                    energy_delta = state.energy - prev_energy
+
+                    # Move succeeded if energy decreased (or stayed same at cap with no regen)
+                    # Move failed if energy increased (got regen but no cost)
+                    move_succeeded = energy_delta <= 0
+
+                    # Edge case: at energy cap, failed move shows delta=0
+                    # But successful move at cap shows delta=-2
+                    # So delta <= 0 still works, but delta == 0 at cap is ambiguous
+                    # If at cap and delta == 0, check if target is known obstacle
+                    if energy_delta == 0 and prev_energy >= 254:
+                        new_row = state.row + dr
+                        new_col = state.col + dc
+                        if is_within_bounds(state, new_row, new_col):
+                            if state.occupancy[new_row][new_col] == CellType.OBSTACLE.value:
+                                move_succeeded = False
+
+                    if move_succeeded:
+                        state.row += dr
+                        state.col += dc
 
         state.using_object_this_step = False
 
@@ -373,6 +402,7 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
                 state.occupancy[r][c] = CellType.OBSTACLE.value
                 if state.chest is None:
                     state.chest = pos
+                    logger.debug(f"  -> DISCOVERED chest at {pos}")
 
             elif "charger" in obj_name or "solar" in obj_name:
                 state.occupancy[r][c] = CellType.OBSTACLE.value
@@ -481,7 +511,7 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
         if state.phase == Phase.ASSEMBLE:
             return "heart_a"
         elif state.phase == Phase.DELIVER:
-            return "default"  # Deposit mode
+            return "heart_b"  # Deposit hearts to chest
         elif state.phase == Phase.GATHER and state.target_resource:
             return RESOURCE_TO_VIBE.get(state.target_resource, "default")
         return "default"
@@ -615,19 +645,23 @@ class SpiderPolicyImpl(StatefulPolicyImpl[SpiderState]):
     def _do_deliver(self, state: SpiderState) -> Action:
         """Execute delivery phase."""
         if state.chest is None:
+            logger.debug("  -> DELIVER: No chest known!")
             return self._noop()
 
         current = (state.row, state.col)
 
         if is_adjacent(current, state.chest):
             # Use chest
+            logger.debug(f"  -> DELIVER: Adjacent to chest at {state.chest}, using it")
             return self._use_object(state, state.chest)
 
         # Move toward chest
         path = find_path_to_target(state, state.chest, reach_adjacent=True)
         if path:
+            logger.debug(f"  -> DELIVER: current={current}, chest={state.chest}, path[0]={path[0]}, path_len={len(path)}")
             return self._follow_path(state, path)
 
+        logger.debug(f"  -> DELIVER: No path to chest at {state.chest} from {current}")
         return self._noop()
 
     def _do_recharge(self, state: SpiderState) -> Action:

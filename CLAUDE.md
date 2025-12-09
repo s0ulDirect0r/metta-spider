@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+**Note**: This project uses [bd (beads)](https://github.com/steveyegge/beads)
+for issue tracking. Use `bd` commands instead of markdown TODOs.
+See AGENTS.md for workflow details.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
@@ -25,6 +29,8 @@ source .venv/bin/activate
 
 Policy syntax uses comma-separated `key=value` pairs: `class=<name>,data=<weights>,proportion=<float>`
 
+**Note**: Our policy requires the full class path (`metta_spider.agent.MettaSpiderPolicy`) because mettagrid's policy discovery only searches hardcoded packages. See `metta-spider-hdh` for upstream feature request.
+
 ```bash
 # Install dependencies
 uv pip install -e .
@@ -39,24 +45,24 @@ cogames play -m easy_mode -p class=baseline
 # Play with text renderer (avoids GUI hangs)
 cogames play -m easy_mode -p class=baseline --render text --steps 100
 
-# Play with your policy
-cogames play -m easy_mode -p class=metta_spider
+# Play with your policy (requires full class path)
+cogames play -m easy_mode -p class=metta_spider.agent.MettaSpiderPolicy
 
 # Evaluate your policy
-cogames eval -m easy_mode -p class=metta_spider
+cogames eval -m easy_mode -p class=metta_spider.agent.MettaSpiderPolicy
 
 # Evaluate on multiple missions
-cogames eval -set integrated_evals -p class=metta_spider
+cogames eval -set integrated_evals -p class=metta_spider.agent.MettaSpiderPolicy
 
 # Train an LSTM policy on easy_mode
 cogames train -m easy_mode -p class=lstm
 
 # Submit to Alignment League (requires login)
 cogames login
-cogames submit -p class=metta_spider -n "My Submission Name"
+cogames submit -p class=metta_spider.agent.MettaSpiderPolicy -n "My Submission Name"
 
 # Dry run submission validation
-cogames submit -p class=metta_spider -n "Test" --dry-run
+cogames submit -p class=metta_spider.agent.MettaSpiderPolicy -n "Test" --dry-run
 ```
 
 ### easy_mode variants
