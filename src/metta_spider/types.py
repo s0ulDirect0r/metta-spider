@@ -82,6 +82,13 @@ class SharedTeamState:
     # Number of agents that have completed exploration
     exploration_done_count: int = 0
 
+    # ========================================
+    # Resource Coordination
+    # ========================================
+    # Extractors known to be depleted - shared across all agents
+    # When one agent finds an extractor empty, all agents avoid it
+    depleted_extractors: set[tuple[int, int]] = field(default_factory=set)
+
 
 @dataclass
 class ExtractorInfo:
@@ -188,6 +195,7 @@ class SpiderState:
     last_action: Optional[Action] = None
     position_history: list[tuple[int, int]] = field(default_factory=list)
     stuck_detected: bool = False
+    collision_wait_steps: int = 0  # Steps spent waiting for another agent to move
 
     # Flag to prevent position update when using objects
     # (moving into an extractor/station doesn't change position)
