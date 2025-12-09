@@ -4,12 +4,84 @@
 
 ## Role
 
-**ML/RL specialist** building winning policies for Alignment League. Primary goal: produce more HEARTs than competitors.
+**Game AI engineer** building a scripted agent for Alignment League.
+This is a **Finite State Machine**, not machine learning (yet).
 
-Think like an RL researcher:
-- Debug by instrumenting/visualizing, not guessing
-- Ask "what helps the policy learn?" not just "what's correct"
-- When stuck, simplify the problem first
+Think like a game AI programmer:
+- State machines need robust transitions AND fallback behaviors
+- If the agent is stuck, it's missing a transition condition or fallback
+- Debug by tracing state + observations, not guessing
+- Every action should have a "what if this fails?" plan
+
+---
+
+## Mental Model
+
+This is a **cooperative multi-agent game** where agents must:
+1. Explore to find resources and stations
+2. Gather 4 resource types from extractors
+3. Assemble resources into HEARTs
+4. Deposit HEARTs in chest
+
+Each agent runs a **finite state machine** with phases:
+EXPLORE → GATHER → ASSEMBLE → DELIVER (+ RECHARGE interrupt)
+
+**The implementation challenge**: Agents need to handle failure gracefully.
+What if an extractor is depleted? What if pathfinding fails?
+What if another agent is blocking? The baseline agent handles
+these; ours often doesn't.
+
+---
+
+## Strategic Questions (The Real Challenges)
+
+These are the *design* questions that matter more than fixing bugs:
+
+1. **Agent specialization**: Should each agent gather all 4 resources, or specialize? Assembly lines vs generalists?
+
+2. **Coordination**: How do N agents divide work without collision? Who goes where?
+
+3. **Partial observability**: Agents only see 11x11. How to reason about unseen map state?
+
+4. **Efficiency vs robustness**: Aggressive strategies score higher until they break. How defensive?
+
+5. **Meta-game**: What beats the baseline? What beats *that*?
+
+We can't explore these until the FSM stops breaking on basic edge cases.
+
+---
+
+## Known Issues
+
+| Issue | Symptom | Root Cause |
+|-------|---------|------------|
+| Stuck at depleted extractor | 76+ stuck events per episode | No fallback when extractor gives nothing |
+| Oscillation loops | Agent bounces between 2 positions | escape_stuck doesn't clear waiting state |
+| Excessive noops | 7000+ noops per 1000 steps | Waiting at broken extractors |
+
+---
+
+## Debugging Workflow
+
+```bash
+# Run with trace
+cogames play -m training_facility -p class=metta_spider.agent.MettaSpiderPolicy --render none --steps 500
+
+# Check event counts (healthy: <10 stuck, broken: 50+)
+cat /tmp/metta_spider.jsonl | jq -r '.event' | sort | uniq -c | sort -rn
+
+# Find stuck patterns
+grep -E "stuck|escape" /tmp/metta_spider.jsonl
+
+# Trace specific failure window
+cat /tmp/metta_spider.jsonl | jq -c 'select(.step > 100 and .step < 150)'
+
+# See what resource agent is stuck trying to gather
+cat /tmp/metta_spider.jsonl | jq -c 'select(.event == "gather_target")' | tail -20
+```
+
+**Healthy run**: <10 stuck events, gathered events match expected resources
+**Broken run**: 50+ stuck events, same gather_target repeating forever
 
 ---
 
@@ -17,14 +89,13 @@ Think like an RL researcher:
 
 ```bash
 # Run policy (MUST use full class path)
-cogames play -m easy_mode -p class=metta_spider.agent.MettaSpiderPolicy --render unicode --steps 100
+cogames play -m training_facility -p class=metta_spider.agent.MettaSpiderPolicy --render unicode --steps 100
 
 # Evaluate
-cogames eval -m easy_mode -p class=metta_spider.agent.MettaSpiderPolicy
 cogames eval -set integrated_evals -p class=metta_spider.agent.MettaSpiderPolicy
 
 # Baseline comparison
-cogames play -m easy_mode -p class=baseline --render text --steps 100
+cogames play -m training_facility -p class=baseline --render text --steps 100
 
 # View traces (structured JSON)
 cat /tmp/metta_spider.jsonl | jq .
@@ -43,7 +114,7 @@ cat /tmp/metta_spider.log
 src/metta_spider/
 ├── __init__.py      # Exports MettaSpiderPolicy
 ├── agent.py         # Main policy logic (SpiderPolicyImpl)
-├── types.py         # SpiderState, SharedTeamState, Phase, AgentRole
+├── types.py         # SpiderState, SharedTeamState, Phase
 ├── pathfinding.py   # A* pathfinding, direction helpers
 └── exploration.py   # Frontier-based exploration
 ```
@@ -52,34 +123,17 @@ src/metta_spider/
 - `MettaSpiderPolicy(MultiAgentPolicy)` → factory, creates per-agent policies
 - `SpiderPolicyImpl(StatefulPolicyImpl)` → core decision logic
 - `SpiderState` → per-agent persistent state (map, inventory, phase)
-- `SharedTeamState` → team coordination (shared discoveries, deposit tracking)
+- `SharedTeamState` → team coordination (shared map discoveries)
 
 ---
 
-## Current Implementation
-
-### Role Assignment
-
-| Agent ID | Role | Behavior |
-|----------|------|----------|
-| 0 | CARBON | Gather carbon → deposit to chest |
-| 1 | OXYGEN | Gather oxygen → deposit to chest |
-| 2 | GERMANIUM | Gather germanium → deposit to chest |
-| 3 | SILICON | Gather silicon → deposit → withdraw all → assemble → deliver |
-
-### Phase State Machine
+## Phase State Machine
 
 ```text
 EXPLORE ─────────────────────────────────────────────────┐
     │ (map complete)                                     │
     ▼                                                    │
-GATHER ◄─────────────────────────────────────────────┐   │
-    │ (have resource)                                │   │
-    ▼                                                │   │
-DEPOSIT ─────────────────────────────────────────────┘   │
-    │ (deposited, silicon role only)                     │
-    ▼                                                    │
-WITHDRAW ────────────────────────────────────────────────┤
+GATHER ◄─────────────────────────────────────────────────┤
     │ (have all resources)                               │
     ▼                                                    │
 ASSEMBLE                                                 │
@@ -92,49 +146,20 @@ DELIVER ────────────────────────
 RECHARGE interrupts any phase when energy < 30
 ```
 
-### Coordination via SharedTeamState
-
-- **Shared discoveries**: First agent to find chest/assembler/charger/extractors shares with team
-- **Deposit tracking**: `deposited_resources` dict so assembler knows when resources available
-- **Exploration count**: Track how many agents finished exploring
-
-### Trace Logging
-
-Structured JSON traces to `/tmp/metta_spider.jsonl`:
-```json
-{"event": "phase", "agent": 0, "step": 42, "old": "explore", "new": "gather"}
-{"event": "gathered", "agent": 0, "step": 55, "resource": "carbon", "gained": 1}
-```
-
-Events: `role_assigned`, `init`, `discovered`, `shared`, `phase`, `gathered`, `deposit`, `withdraw`, `assemble`, `deliver`, `stuck`, `escape_stuck`
-
 ---
 
-## Common Mistakes
+## FSM Design Principles
 
-| Mistake | Symptom | Fix |
-|---------|---------|-----|
-| Short class path `class=MettaSpiderPolicy` | Policy not found | Use `class=metta_spider.agent.MettaSpiderPolicy` |
-| Wrong location unpacking | Agent acts on wrong positions | Row = `loc >> 4`, Col = `loc & 0xF` (but we use tuple now) |
-| Ignoring energy | Agent stops mid-episode | Check against `ENERGY_LOW=30` threshold |
-| Wrong vibe for interaction | Interaction does nothing | `resource_a` = extract/withdraw, `resource_b` = deposit |
-| Not finding stations | Agents wander | Check trace for `discovered` events, verify exploration completes |
-| Stuck in oscillation | Agent bounces between positions | `stuck_detected` flag triggers `_escape_stuck()` |
+**Every state needs:**
+1. **Entry condition** - when do we enter this state?
+2. **Exit condition** - when do we leave?
+3. **Failure fallback** - what if we can't make progress?
+4. **Timeout** - max time before forcing a transition
 
----
-
-## Success Criteria
-
-| Mission | Target | Notes |
-|---------|--------|-------|
-| easy_mode (500 steps) | ≥3 hearts | With `lonely_heart` rules (1 resource each) |
-| integrated_evals | Top 50% | Diverse map layouts |
-
-**Health checks:**
-- No "stuck" periods >12 steps with ≤4 unique positions
-- Energy never hits 0 (planning failure)
-- All 4 extractors + chest found (check trace for `discovered` events)
-- Phase transitions happening (check trace for `phase` events)
+**Current gaps:**
+- GATHER has no fallback when extractor is depleted
+- No timeout on waiting for resources
+- escape_stuck doesn't reset gathering state
 
 ---
 
@@ -158,15 +183,17 @@ Events: `role_assigned`, `init`, `discovered`, `shared`, `phase`, `gathered`, `d
 
 Baseline scripted agent: `../cogames/src/cogames/policy/scripted_agent/`
 - `baseline_agent.py` - full pathfinding implementation
-- `utils.py` - `manhattan_distance`, `position_to_direction`, etc.
+- Study how it handles edge cases we're missing
 
 ---
 
-## Extended Context
+## Future: ML Phase
 
-For MARL architecture decisions, training pipelines, or reward shaping, see `.claude/marl-knowledge.md`. Covers:
-- Credit assignment strategies
-- Coordination mechanisms (explicit vs emergent)
-- Architecture options (set encoders, CNNs, attention)
-- Training phases (BC → RL fine-tuning → self-play)
-- Debugging patterns for learned policies
+When the FSM is robust, we can use it for:
+- Behavioral cloning (imitation learning from the scripted agent)
+- RL fine-tuning
+- Self-play and population-based training
+
+But that's Phase 2. Phase 1 is making the FSM actually work.
+
+For MARL architecture notes when we get there, see `.claude/marl-knowledge.md`.
