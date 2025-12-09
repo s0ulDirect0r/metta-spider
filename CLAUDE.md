@@ -1,144 +1,172 @@
-# CLAUDE.md
+# CLAUDE.md – metta-spider
 
-**Note**: This project uses [bd (beads)](https://github.com/steveyegge/beads)
-for issue tracking. Use `bd` commands instead of markdown TODOs.
-See AGENTS.md for workflow details.
+> Issue tracking: `bd` commands (not markdown TODOs). See AGENTS.md.
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## Role
 
-## Project Overview
+**ML/RL specialist** building winning policies for Alignment League. Primary goal: produce more HEARTs than competitors.
 
-This is an **Alignment League** submission for the Cogs vs Clips game, built on the MettaGrid/CoGames framework. The goal is to develop AI agents ("Cogs") that cooperate to produce HEARTs by gathering resources, operating machinery, and assembling components.
+Think like an RL researcher:
+- Debug by instrumenting/visualizing, not guessing
+- Ask "what helps the policy learn?" not just "what's correct"
+- When stuck, simplify the problem first
 
-The project name is `metta-spider` and exports a `MettaSpiderPolicy` class.
+---
 
-## Requirements
-
-- **Python 3.12** (required - mettagrid C++ bindings don't work with 3.13+)
-
-```bash
-# Install Python 3.12 if needed
-uv python install 3.12.11
-
-# Create venv with correct Python
-uv venv .venv --python 3.12
-source .venv/bin/activate
-```
-
-## Development Commands
-
-Policy syntax uses comma-separated `key=value` pairs: `class=<name>,data=<weights>,proportion=<float>`
-
-**Note**: Our policy requires the full class path (`metta_spider.agent.MettaSpiderPolicy`) because mettagrid's policy discovery only searches hardcoded packages. See `metta-spider-hdh` for upstream feature request.
+## Quick Reference
 
 ```bash
-# Install dependencies
-uv pip install -e .
+# Run policy (MUST use full class path)
+cogames play -m easy_mode -p class=metta_spider.agent.MettaSpiderPolicy --render unicode --steps 100
 
-# List available missions and policies
-cogames missions
-cogames policies
-
-# Play easy_mode with baseline scripted policy (good for testing)
-cogames play -m easy_mode -p class=baseline
-
-# Play with text renderer (avoids GUI hangs)
-cogames play -m easy_mode -p class=baseline --render text --steps 100
-
-# Play with your policy (requires full class path)
-cogames play -m easy_mode -p class=metta_spider.agent.MettaSpiderPolicy
-
-# Evaluate your policy
+# Evaluate
 cogames eval -m easy_mode -p class=metta_spider.agent.MettaSpiderPolicy
-
-# Evaluate on multiple missions
 cogames eval -set integrated_evals -p class=metta_spider.agent.MettaSpiderPolicy
 
-# Train an LSTM policy on easy_mode
-cogames train -m easy_mode -p class=lstm
+# Baseline comparison
+cogames play -m easy_mode -p class=baseline --render text --steps 100
 
-# Submit to Alignment League (requires login)
-cogames login
-cogames submit -p class=metta_spider.agent.MettaSpiderPolicy -n "My Submission Name"
+# View traces (structured JSON)
+cat /tmp/metta_spider.jsonl | jq .
 
-# Dry run submission validation
-cogames submit -p class=metta_spider.agent.MettaSpiderPolicy -n "Test" --dry-run
+# View text log
+cat /tmp/metta_spider.log
 ```
 
-### easy_mode variants
+**Requirements**: Python 3.12 (mettagrid C++ bindings fail on 3.13+)
 
-The `easy_mode` mission uses simplified rules for training:
-- `lonely_heart` - Heart crafting needs only 1 of each resource
-- `heart_chorus` - Reward shaping for hearts and diverse inventories
-- `pack_rat` - All capacity limits raised to 255
+---
 
 ## Architecture
 
-### Policy Structure
-
-```
+```text
 src/metta_spider/
-├── __init__.py          # Exports MettaSpiderPolicy
-└── agent.py             # Policy implementation
+├── __init__.py      # Exports MettaSpiderPolicy
+├── agent.py         # Main policy logic (SpiderPolicyImpl)
+├── types.py         # SpiderState, SharedTeamState, Phase, AgentRole
+├── pathfinding.py   # A* pathfinding, direction helpers
+└── exploration.py   # Frontier-based exploration
 ```
 
-The policy must implement the `MultiAgentPolicy` interface from `mettagrid.policy.policy`:
+**Key classes:**
+- `MettaSpiderPolicy(MultiAgentPolicy)` → factory, creates per-agent policies
+- `SpiderPolicyImpl(StatefulPolicyImpl)` → core decision logic
+- `SpiderState` → per-agent persistent state (map, inventory, phase)
+- `SharedTeamState` → team coordination (shared discoveries, deposit tracking)
 
-- **`MettaSpiderPolicy(MultiAgentPolicy)`**: Factory that creates per-agent policies
-  - `short_names`: List of aliases for CLI registration (e.g., `["metta_spider", "spider"]`)
-  - `agent_policy(agent_id) -> AgentPolicy`: Returns policy for specific agent
+---
 
-- **`SpiderAgentPolicy(AgentPolicy)`**: Per-agent decision-making
-  - `step(obs: AgentObservation) -> Action`: Core method - takes observation, returns action
+## Current Implementation
 
-### Observation Format
+### Role Assignment
 
-Observations are token-based: `AgentObservation.tokens` contains a list of tokens where each token has:
-- `location`: Packed coordinate (upper 4 bits = row, lower 4 bits = col), `0xFF` = empty
-- `feature_id`: What feature this token represents
-- `value`: The feature value
+| Agent ID | Role | Behavior |
+|----------|------|----------|
+| 0 | CARBON | Gather carbon → deposit to chest |
+| 1 | OXYGEN | Gather oxygen → deposit to chest |
+| 2 | GERMANIUM | Gather germanium → deposit to chest |
+| 3 | SILICON | Gather silicon → deposit → withdraw all → assemble → deliver |
 
-Agent is centered at location `0x55` (row 5, col 5) in an 11x11 observation window.
+### Phase State Machine
 
-Access environment info via `self._policy_env_info`:
-- `action_names`: List of available action names
-- `obs_features`: List of observation features
-- `tags`: Object type tags
-- `assembler_protocols`: Recipes for assemblers
+```text
+EXPLORE ─────────────────────────────────────────────────┐
+    │ (map complete)                                     │
+    ▼                                                    │
+GATHER ◄─────────────────────────────────────────────┐   │
+    │ (have resource)                                │   │
+    ▼                                                │   │
+DEPOSIT ─────────────────────────────────────────────┘   │
+    │ (deposited, silicon role only)                     │
+    ▼                                                    │
+WITHDRAW ────────────────────────────────────────────────┤
+    │ (have all resources)                               │
+    ▼                                                    │
+ASSEMBLE                                                 │
+    │ (have hearts)                                      │
+    ▼                                                    │
+DELIVER ─────────────────────────────────────────────────┘
+    │ (delivered)
+    └──► back to GATHER
 
-### Available Actions
+RECHARGE interrupts any phase when energy < 30
+```
 
-Return actions by name: `Action(name="move_north")`, `Action(name="noop")`, etc.
+### Coordination via SharedTeamState
 
-- **Movement**: `move_north`, `move_south`, `move_east`, `move_west`
-- **Vibes**: `change_vibe_heart_a`, `change_vibe_carbon_a`, etc.
-- **Noop**: `noop`
+- **Shared discoveries**: First agent to find chest/assembler/charger/extractors shares with team
+- **Deposit tracking**: `deposited_resources` dict so assembler knows when resources available
+- **Exploration count**: Track how many agents finished exploring
 
-Moving into a station/object triggers interaction. Vibes affect interaction protocols.
+### Trace Logging
 
-### Game Mechanics (Cogs vs Clips)
+Structured JSON traces to `/tmp/metta_spider.jsonl`:
+```json
+{"event": "phase", "agent": 0, "step": 42, "old": "explore", "new": "gather"}
+{"event": "gathered", "agent": 0, "step": 55, "resource": "carbon", "gained": 1}
+```
 
-**Goal**: Produce HEARTs and deposit them in chests.
+Events: `role_assigned`, `init`, `discovered`, `shared`, `phase`, `gathered`, `deposit`, `withdraw`, `assemble`, `deliver`, `stuck`, `escape_stuck`
 
-**Resources**: carbon, oxygen, germanium, silicon (gather from extractors)
+---
 
-**Stations**:
-- **Extractors**: Harvest resources (carbon, oxygen, germanium, silicon extractors)
-- **Assemblers**: Convert resources to HEARTs (requires specific vibe + adjacent Cogs)
-- **Chests**: Store/retrieve resources and HEARTs (vibe controls deposit/withdraw)
-- **Solar Arrays**: Recharge energy
+## Common Mistakes
 
-**Energy**: Most actions cost energy. Passive +1/turn, solar arrays give +50.
+| Mistake | Symptom | Fix |
+|---------|---------|-----|
+| Short class path `class=MettaSpiderPolicy` | Policy not found | Use `class=metta_spider.agent.MettaSpiderPolicy` |
+| Wrong location unpacking | Agent acts on wrong positions | Row = `loc >> 4`, Col = `loc & 0xF` (but we use tuple now) |
+| Ignoring energy | Agent stops mid-episode | Check against `ENERGY_LOW=30` threshold |
+| Wrong vibe for interaction | Interaction does nothing | `resource_a` = extract/withdraw, `resource_b` = deposit |
+| Not finding stations | Agents wander | Check trace for `discovered` events, verify exploration completes |
+| Stuck in oscillation | Agent bounces between positions | `stuck_detected` flag triggers `_escape_stuck()` |
 
-## Reference Implementations
+---
 
-Look at `../cogames/src/cogames/policy/scripted_agent/` for examples:
-- `baseline_agent.py`: Full-featured scripted agent with pathfinding
-- `starter_agent.py`: Simpler agent for reference
-- `types.py`: Data structures for agent state
-- `utils.py`: Helper functions (manhattan_distance, position_to_direction, etc.)
+## Success Criteria
 
-## Key Dependencies
+| Mission | Target | Notes |
+|---------|--------|-------|
+| easy_mode (500 steps) | ≥3 hearts | With `lonely_heart` rules (1 resource each) |
+| integrated_evals | Top 50% | Diverse map layouts |
 
-- `mettagrid`: Core simulation and policy interfaces
-- `cogames`: Game environment, CLI, and built-in policies
+**Health checks:**
+- No "stuck" periods >12 steps with ≤4 unique positions
+- Energy never hits 0 (planning failure)
+- All 4 extractors + chest found (check trace for `discovered` events)
+- Phase transitions happening (check trace for `phase` events)
+
+---
+
+## Game Mechanics
+
+**Goal**: Gather resources → assemble HEARTs → deposit in chest
+
+**Resources**: carbon, oxygen, germanium, silicon (from extractors)
+
+**Vibes** (must set correct vibe before interaction):
+- `resource_a`: Extract from extractor OR withdraw from chest
+- `resource_b`: Deposit resource to chest
+- `heart_a`: Assemble hearts at assembler
+- `heart_b`: Deposit hearts to chest
+
+**Energy**: Most actions cost energy. Passive +1/turn. Solar arrays give +50.
+
+---
+
+## Reference Code
+
+Baseline scripted agent: `../cogames/src/cogames/policy/scripted_agent/`
+- `baseline_agent.py` - full pathfinding implementation
+- `utils.py` - `manhattan_distance`, `position_to_direction`, etc.
+
+---
+
+## Extended Context
+
+For MARL architecture decisions, training pipelines, or reward shaping, see `.claude/marl-knowledge.md`. Covers:
+- Credit assignment strategies
+- Coordination mechanisms (explicit vs emergent)
+- Architecture options (set encoders, CNNs, attention)
+- Training phases (BC → RL fine-tuning → self-play)
+- Debugging patterns for learned policies

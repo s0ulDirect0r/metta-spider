@@ -28,16 +28,104 @@ class Phase(Enum):
     The agent progresses through these phases:
     1. EXPLORE - Build complete map knowledge before doing anything else
     2. GATHER - Collect resources from extractors
-    3. ASSEMBLE - Combine resources into hearts at assembler
-    4. DELIVER - Deposit hearts into chest
+    3. DEPOSIT - Deposit resources to shared chest (gatherers only)
+    4. WITHDRAW - Withdraw resources from chest (assembler only)
+    5. ASSEMBLE - Combine resources into hearts at assembler
+    6. DELIVER - Deposit hearts into chest
 
     RECHARGE can interrupt any phase when energy is low.
     """
     EXPLORE = "explore"    # Initial phase: map the entire arena
     GATHER = "gather"      # Collect resources from extractors
+    DEPOSIT = "deposit"    # Deposit resources to chest (gatherers)
+    WITHDRAW = "withdraw"  # Withdraw resources from chest (assembler)
     ASSEMBLE = "assemble"  # Make hearts at assembler
     DELIVER = "deliver"    # Deposit hearts to chest
     RECHARGE = "recharge"  # Recharge energy at charger
+
+
+# ============================================================================
+# Role System
+# ============================================================================
+
+class AgentRole(Enum):
+    """
+    Fixed role assignments for multi-agent coordination.
+
+    Each agent specializes in one resource:
+    - All agents gather their assigned resource and deposit to chest
+    - Only the SILICON role withdraws resources and assembles hearts
+    """
+    CARBON = "carbon"        # Agent 0: gathers carbon
+    OXYGEN = "oxygen"        # Agent 1: gathers oxygen
+    GERMANIUM = "germanium"  # Agent 2: gathers germanium
+    SILICON = "silicon"      # Agent 3: gathers silicon + assembles hearts
+
+
+# Role assignment by agent_id
+ROLE_BY_AGENT_ID: dict[int, AgentRole] = {
+    0: AgentRole.CARBON,
+    1: AgentRole.OXYGEN,
+    2: AgentRole.GERMANIUM,
+    3: AgentRole.SILICON,
+}
+
+
+@dataclass
+class SharedTeamState:
+    """
+    Shared state between all agents on the team.
+
+    This is the "team brain" - any agent can read/write to this to share
+    discoveries and coordinate actions. Held by the MettaSpiderPolicy and
+    passed to each agent's policy.
+
+    Thread safety: In the game sim, agents step sequentially (not in parallel),
+    so we don't need locks. Each agent sees the most recent state.
+    """
+
+    # ========================================
+    # Shared Map Knowledge
+    # ========================================
+    # Best known extractor for each resource type
+    # Dict[resource_type -> position or None]
+    extractors: dict[str, tuple[int, int] | None] = field(
+        default_factory=lambda: {
+            "carbon": None,
+            "oxygen": None,
+            "germanium": None,
+            "silicon": None,
+        }
+    )
+
+    # Key station positions (first agent to find them shares with team)
+    assembler: Optional[tuple[int, int]] = None
+    chest: Optional[tuple[int, int]] = None
+    charger: Optional[tuple[int, int]] = None
+
+    # ========================================
+    # Exploration Coordination
+    # ========================================
+    # Frontier cells that have been tried and found unreachable
+    # This prevents multiple agents from getting stuck on the same bad frontier
+    tried_frontiers: set[tuple[int, int]] = field(default_factory=set)
+
+    # Number of agents that have completed exploration
+    exploration_done_count: int = 0
+
+    # ========================================
+    # Resource Tracking (for assembler)
+    # ========================================
+    # What the team has deposited to the chest (so assembler knows when to withdraw)
+    # Reset after assembler withdraws
+    deposited_resources: dict[str, int] = field(
+        default_factory=lambda: {
+            "carbon": 0,
+            "oxygen": 0,
+            "germanium": 0,
+            "silicon": 0,
+        }
+    )
 
 
 @dataclass
@@ -168,6 +256,19 @@ class SpiderState:
     wait_steps: int = 0
     pending_resource: Optional[str] = None
     pending_amount: int = 0
+
+    # ========================================
+    # Deposit Verification State
+    # ========================================
+    pending_deposit_resource: Optional[str] = None
+    pending_deposit_amount: int = 0
+
+    # ========================================
+    # Withdraw Verification State
+    # ========================================
+    # Track inventory before withdraw to verify success
+    pending_withdraw: bool = False
+    inventory_before_withdraw: dict[str, int] = field(default_factory=dict)
 
 
 def create_initial_state(agent_id: int, map_size: int = 200) -> SpiderState:
